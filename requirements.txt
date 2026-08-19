@@ -1,0 +1,6 @@
+pywin32>=305
+uiautomation>=2.0.18
+pystray>=0.19.0
+Pillow>=9.0.0
+pycaw>=20240210
+comtypes>=1.4.0

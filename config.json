@@ -1,0 +1,8 @@
+{
+    "device_name": "",
+    "volume_step": 5,
+    "window_title": "TuneBlade",
+    "poll_interval_sec": 1.0,
+    "autostart": false,
+    "debug_log": false
+}
