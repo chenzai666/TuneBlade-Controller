@@ -4,7 +4,7 @@ TuneBlade Controller — tray-resident volume bridge.
 - Volume keys control the device slider named in config (default: 游戏室).
 - Step is exactly volume_step percent (default: 5) via RangeValuePattern.
 - Only intercept when Master is ON and system has speakers; otherwise pass through.
-- Low-level hook is fail-safe so normal typing never breaks.
+- Uses RegisterHotKey (no WH_KEYBOARD_LL) so typing / mouse never freeze.
 """
 
 from __future__ import annotations
@@ -55,6 +55,7 @@ DEFAULT_CFG = {
     "poll_interval_sec": 1.0,
     "autostart": False,
     "debug_log": False,  # True 才写 TuneBladeController.log，日常请保持关闭
+    "auto_enable_master": True,  # 仅启动时自动开一次 Master；用户手动关掉后不再强开
 }
 
 _debug_log_enabled = False
@@ -165,18 +166,27 @@ def has_system_audio() -> bool:
 
 class SystemVolumeLock:
     """
-    Many laptops never deliver VK_VOLUME_* to WH_KEYBOARD_LL — they only
-    change the Windows endpoint volume. While armed we:
-      1) detect that system volume/mute changed
-      2) snap it back to the baseline
-      3) return 'up' / 'down' / 'mute' so TuneBlade can mirror the intent
+    When TuneBlade is active (armed):
+      - Remember the user's previous system volume/mute
+      - Force the Windows speakers muted (so local PC is silent)
+      - If media keys still nudge the OS volume, snap mute back and
+        optionally report 'up'/'down'/'mute' for TuneBlade
+
+    When disarmed (Master OFF / device gone):
+      - Restore the previous system volume/mute
     """
 
     def __init__(self):
         self._lock = threading.Lock()
         self._active = False
-        self._baseline = None  # float 0..1
-        self._baseline_mute = None
+        # While armed we keep the OS at this frozen state (muted)
+        self._hold_vol = None
+        self._hold_mute = 1
+        # User's real system state before we took over — restored on disarm
+        self._saved_vol = None
+        self._saved_mute = None
+        # True after we muted OS until we successfully release speakers
+        self._we_muted = False
         self._ep = None
         self._cooldown_until = 0.0
 
@@ -194,65 +204,125 @@ class SystemVolumeLock:
             return None
 
     def arm(self):
+        """Take over: save system volume, then mute speakers."""
         with self._lock:
             ep = self._endpoint()
             if ep is None:
                 self._active = False
                 return
             try:
-                self._baseline = float(ep.GetMasterVolumeLevelScalar())
-                self._baseline_mute = int(ep.GetMute())
+                cur_vol = float(ep.GetMasterVolumeLevelScalar())
+                cur_mute = int(ep.GetMute())
+                # Only snapshot once per arm session
+                if not self._active:
+                    self._saved_vol = cur_vol
+                    self._saved_mute = cur_mute
+                # Hold point while TB is on: keep level, force muted
+                self._hold_vol = cur_vol if self._saved_vol is None else float(self._saved_vol)
+                self._hold_mute = 1
+                ep.SetMasterVolumeLevelScalar(self._hold_vol, None)
+                ep.SetMute(1, None)
                 self._active = True
-                self._cooldown_until = 0.0
+                self._we_muted = True
+                self._cooldown_until = time.monotonic() + 0.35
                 _log(
-                    f"[sysvol] armed baseline={self._baseline:.3f} mute={self._baseline_mute}"
+                    f"[sysvol] armed — system muted "
+                    f"(saved vol={self._saved_vol:.3f} mute={self._saved_mute})"
                 )
             except Exception as e:
                 _log(f"[sysvol] arm failed: {e}")
                 self._active = False
 
     def disarm(self):
+        """Give speakers back: restore volume and unmute.
+
+        Safe to call every poll while inactive — only touches OS when we
+        actually had muted it (or still have a saved snapshot).
+        Always SetMute(0) on release (never restore a stale mute=1).
+        """
         with self._lock:
+            ep = self._endpoint()
+            was = self._active
+            saved = self._saved_vol
+            release = was or self._we_muted or saved is not None
             self._active = False
-            self._baseline = None
-            _log("[sysvol] disarmed")
+            self._hold_vol = None
+            self._saved_vol = None
+            self._saved_mute = None
+            if ep is None or not release:
+                return
+            try:
+                if saved is not None:
+                    ep.SetMasterVolumeLevelScalar(float(saved), None)
+                ep.SetMute(0, None)
+                self._we_muted = False
+                _log(
+                    f"[sysvol] disarmed — unmuted"
+                    + (f" vol={saved:.3f}" if saved is not None else "")
+                )
+            except Exception as e:
+                _log(f"[sysvol] disarm restore failed: {e}")
+
+    def clear_leftover_mute(self):
+        """Unmute once if OS is still muted while we are not armed (stale state)."""
+        with self._lock:
+            if self._active:
+                return False
+            ep = self._endpoint()
+            if ep is None:
+                return False
+            try:
+                if int(ep.GetMute()) != 1:
+                    self._we_muted = False
+                    return False
+                if self._saved_vol is not None:
+                    ep.SetMasterVolumeLevelScalar(float(self._saved_vol), None)
+                ep.SetMute(0, None)
+                self._we_muted = False
+                self._saved_vol = None
+                self._saved_mute = None
+                self._hold_vol = None
+                _log("[sysvol] cleared leftover system mute")
+                return True
+            except Exception as e:
+                _log(f"[sysvol] clear leftover failed: {e}")
+                return False
 
     @property
     def active(self) -> bool:
         return self._active
 
     def freeze(self) -> bool:
-        """Restore baseline only (no command)."""
+        """Keep OS muted at hold point (no TuneBlade command)."""
         with self._lock:
-            return self._restore_unlocked()
+            return self._hold_unlocked()
 
-    def _restore_unlocked(self) -> bool:
-        if not self._active or self._baseline is None:
+    def _hold_unlocked(self) -> bool:
+        if not self._active or self._hold_vol is None:
             return False
         ep = self._endpoint()
         if ep is None:
             return False
         try:
-            ep.SetMasterVolumeLevelScalar(self._baseline, None)
-            ep.SetMute(int(self._baseline_mute or 0), None)
+            ep.SetMasterVolumeLevelScalar(float(self._hold_vol), None)
+            ep.SetMute(1, None)
             return True
         except Exception as e:
-            _log(f"[sysvol] restore: {e}")
+            _log(f"[sysvol] hold: {e}")
             return False
 
     def poll_redirect(self) -> str | None:
         """
-        If OS volume changed since baseline, restore it and return
-        'up' | 'down' | 'mute'. None if nothing happened.
+        If OS volume/mute drifted from the muted hold point, snap it back
+        and return 'up' | 'down' | 'mute' for TuneBlade.
         """
         with self._lock:
-            if not self._active or self._baseline is None:
+            if not self._active or self._hold_vol is None:
                 return None
             now = time.monotonic()
             if now < self._cooldown_until:
-                # still settle after our own restore
                 try:
-                    self._restore_unlocked()
+                    self._hold_unlocked()
                 except Exception:
                     pass
                 return None
@@ -267,29 +337,23 @@ class SystemVolumeLock:
                 _log(f"[sysvol] read: {e}")
                 return None
 
-            d_vol = cur - float(self._baseline)
-            d_mute = muted - int(self._baseline_mute or 0)
-
-            if abs(d_vol) < 0.0015 and d_mute == 0:
+            d_vol = cur - float(self._hold_vol)
+            # hold mute is always 1; if unmuted → user tried to raise volume
+            if muted == 1 and abs(d_vol) < 0.0015:
                 return None
 
-            # Classify intent before restoring
-            cmd = None
-            if d_mute != 0 and abs(d_vol) < 0.02:
-                # pure mute toggle
-                cmd = "mute"
-            elif d_vol > 0.0015 or (d_mute < 0 and d_vol >= -0.001):
-                # louder or unmute-via-vol-up
+            if muted == 0 and abs(d_vol) < 0.02:
+                cmd = "up"  # unmute / vol-up while we forced mute
+            elif d_vol > 0.0015:
                 cmd = "up"
             elif d_vol < -0.0015:
                 cmd = "down"
             else:
                 cmd = "mute"
 
-            self._restore_unlocked()
+            self._hold_unlocked()
             self._cooldown_until = now + 0.25
-            _log(f"[sysvol] redirect {cmd} (d_vol={d_vol:+.3f} d_mute={d_mute:+d})")
-            # Dismiss Windows volume flyout (appears before we can swallow Fn-keys)
+            _log(f"[sysvol] redirect {cmd} (d_vol={d_vol:+.3f} muted={muted})")
             try:
                 _osd_burst_hide()
             except Exception:
@@ -297,23 +361,19 @@ class SystemVolumeLock:
             return cmd
 
 
-# Longer cooldown so one media-key press cannot enqueue multiple redirects
-
-
 _sysvol = SystemVolumeLock()
 
 
 def hide_volume_osd() -> None:
     """
-    Hide the Windows volume flyout/OSD that appears on media-key presses.
-    We cannot always swallow Fn-keys before Explorer shows it, so we dismiss
-    the OSD window as soon as we redirect the volume change.
+    Dismiss only the Windows volume flyout (ShellExperienceHost).
+    Never WM_CLOSE explorer XAML islands — that kills menus / mouse clicks.
     """
     try:
-        import win32api
         import win32gui
         import win32process
         import win32con
+        import win32api
     except Exception:
         return
 
@@ -321,19 +381,13 @@ def hide_volume_osd() -> None:
 
     def _pid_name(pid: int) -> str:
         try:
-            import win32api as wapi
-            from win32com.client import GetObject
-
-            # fallback via CreateToolhelp — keep simple
-        except Exception:
-            pass
-        try:
-            h = win32api.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+            h = win32api.OpenProcess(0x1000, False, pid)
             try:
-                # QueryFullProcessImageName
                 buf = ctypes.create_unicode_buffer(260)
                 size = ctypes.c_uint(260)
-                if ctypes.windll.kernel32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)):
+                if ctypes.windll.kernel32.QueryFullProcessImageNameW(
+                    h, 0, buf, ctypes.byref(size)
+                ):
                     return buf.value.lower()
             finally:
                 win32api.CloseHandle(h)
@@ -346,28 +400,16 @@ def hide_volume_osd() -> None:
             if not win32gui.IsWindowVisible(hwnd):
                 return
             cls = win32gui.GetClassName(hwnd) or ""
-            # Win10 classic host + Win10/11 XAML / CoreWindow flyouts
-            if cls not in (
-                "NativeHWNDHost",
-                "Windows.UI.Core.CoreWindow",
-                "XamlExplorerHostIslandWindow",
-                "Windows.Internal.Shell.TabProxyWindow",
-            ):
+            if cls != "NativeHWNDHost":
                 return
             _, pid = win32process.GetWindowThreadProcessId(hwnd)
             path = _pid_name(pid)
-            # Volume OSD lives in explorer or ShellExperienceHost
-            if (
-                "shellexperiencehost" in path
-                or path.endswith("\\explorer.exe")
-                or "explorer.exe" in path
-                or not path
-            ):
-                rect = win32gui.GetWindowRect(hwnd)
-                w, h = rect[2] - rect[0], rect[3] - rect[1]
-                # Volume flyout is a small floating panel, not a full screen window
-                if 40 <= w <= 900 and 40 <= h <= 500:
-                    targets.append(hwnd)
+            if "shellexperiencehost" not in path:
+                return
+            rect = win32gui.GetWindowRect(hwnd)
+            w, h = rect[2] - rect[0], rect[3] - rect[1]
+            if 40 <= w <= 900 and 40 <= h <= 500:
+                targets.append(hwnd)
         except Exception:
             pass
 
@@ -379,17 +421,15 @@ def hide_volume_osd() -> None:
     for hwnd in targets:
         try:
             win32gui.ShowWindow(hwnd, win32con.SW_HIDE)
-            # also try closing/destroying the flyout host gently
-            win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
         except Exception:
             pass
 
 
 def _osd_burst_hide():
-    """Hide OSD several times over ~400ms (it can reappear once)."""
+    """Hide the volume flyout a few times (it can reappear once)."""
 
     def _run():
-        for _ in range(8):
+        for _ in range(4):
             hide_volume_osd()
             time.sleep(0.05)
 
@@ -425,81 +465,56 @@ def set_autostart(enabled: bool) -> None:
                 pass
 
 
-# ── keyboard hook (Page Up / Page Down — fail-safe) ───────────────
-# Laptop: Fn+PgUp / Fn+PgDown usually arrive as VK_PRIOR / VK_NEXT.
-# Using these avoids the Windows volume OSD that media keys trigger.
+# ── hotkeys (NO low-level keyboard hook) ──────────────────────────
+# WH_KEYBOARD_LL on a Python thread that also sleeps/polls will freeze
+# typing AND the mouse (Windows waits for the hook; timeout stalls input).
+# RegisterHotKey only steals the combos we care about; everything else
+# (letters, mouse wheel, left click) is untouched.
 
-WH_KEYBOARD_LL = 13
-WM_KEYDOWN = 0x0100
-WM_SYSKEYDOWN = 0x0104
-VK_PRIOR = 0x21  # Page Up   → volume up
-VK_NEXT = 0x22   # Page Down → volume down
-VK_CONTROL = 0x11
-VK_MENU = 0x12  # Alt
+VK_PRIOR = 0x21  # Page Up   → volume up while routing
+VK_NEXT = 0x22   # Page Down → volume down while routing
 VK_Q = 0x51
-VK_M = 0x4D     # Ctrl+Alt+M → mute
-LLKHF_INJECTED = 0x10
+VK_M = 0x4D
+MOD_ALT = 0x0001
+MOD_CONTROL = 0x0002
+MOD_NOREPEAT = 0x4000
+WM_QUIT = 0x0012
+WM_HOTKEY = 0x0312
+WM_APP_SET_VOLKEYS = 0x8001  # WM_APP+1 → enable/disable PgUp/PgDn hotkeys
 
-# 64-bit: WPARAM/LPARAM are pointer-sized. Wrong ctypes types → OverflowError
-# and the hook breaks (volume keys appear to "do nothing").
-LRESULT = ctypes.c_ssize_t
-HHOOK = ctypes.c_void_p
+HOTKEY_QUIT = 1
+HOTKEY_MUTE = 2
+HOTKEY_VOLUP = 3
+HOTKEY_VOLDOWN = 4
+
 WPARAM_T = ctypes.c_size_t
 LPARAM_T = ctypes.c_ssize_t
 
 user32 = ctypes.windll.user32
-user32.CallNextHookEx.argtypes = [HHOOK, ctypes.c_int, WPARAM_T, LPARAM_T]
-user32.CallNextHookEx.restype = LRESULT
-user32.SetWindowsHookExW.argtypes = [
-    ctypes.c_int,
-    ctypes.c_void_p,
-    ctypes.c_void_p,
-    wt.DWORD,
-]
-user32.SetWindowsHookExW.restype = HHOOK
-user32.UnhookWindowsHookEx.argtypes = [HHOOK]
-user32.UnhookWindowsHookEx.restype = wt.BOOL
 user32.PostThreadMessageW.argtypes = [wt.DWORD, wt.UINT, WPARAM_T, LPARAM_T]
 user32.PostThreadMessageW.restype = wt.BOOL
-user32.PeekMessageW.argtypes = [
+user32.GetMessageW.argtypes = [
     ctypes.POINTER(wt.MSG),
     wt.HWND,
     wt.UINT,
     wt.UINT,
-    wt.UINT,
 ]
-user32.PeekMessageW.restype = wt.BOOL
+user32.GetMessageW.restype = ctypes.c_int
+user32.RegisterHotKey.argtypes = [wt.HWND, ctypes.c_int, wt.UINT, wt.UINT]
+user32.RegisterHotKey.restype = wt.BOOL
+user32.UnregisterHotKey.argtypes = [wt.HWND, ctypes.c_int]
+user32.UnregisterHotKey.restype = wt.BOOL
+user32.TranslateMessage.argtypes = [ctypes.POINTER(wt.MSG)]
+user32.DispatchMessageW.argtypes = [ctypes.POINTER(wt.MSG)]
 
-
-class _KBDLLHOOKSTRUCT(ctypes.Structure):
-    _fields_ = [
-        ("vkCode", wt.DWORD),
-        ("scanCode", wt.DWORD),
-        ("flags", wt.DWORD),
-        ("time", wt.DWORD),
-        ("dwExtraInfo", ctypes.c_size_t),
-    ]
-
-
-_LowLevelKeyboardProc = ctypes.WINFUNCTYPE(LRESULT, ctypes.c_int, WPARAM_T, LPARAM_T)
-_vol_hook_handle = None
-_vol_hook_proc = None
 _intercept_flag = ctypes.c_int(0)
-_cmd_queue = None  # queue.Queue set in main — hook only enqueues, never touches UIA
+_cmd_queue = None
 _last_vol_cmd_at = 0.0
 _last_vol_cmd = None
-# One physical tap often repeats KEYDOWN several times → was jumping 0→20 (4×5).
 _VOL_DEBOUNCE_SEC = 0.22
-
-
-def _call_next(nCode, wParam, lParam):
-    # Must return a plain Python int from the hook callback (not c_longlong),
-    # otherwise ctypes raises: converting result of callback ... c_longlong
-    r = user32.CallNextHookEx(None, int(nCode), WPARAM_T(wParam), LPARAM_T(lParam))
-    try:
-        return int(r)
-    except Exception:
-        return 0
+_hotkey_thread_id = None
+_main_thread_id = None
+_quit_event = threading.Event()
 
 
 def _enqueue_vol(cmd: str) -> bool:
@@ -512,120 +527,101 @@ def _enqueue_vol(cmd: str) -> bool:
         _last_vol_cmd_at = now
         _last_vol_cmd = cmd
     try:
+        if _cmd_queue is None:
+            return False
         _cmd_queue.put_nowait(cmd)
         return True
     except Exception:
         return False
 
 
-def install_volume_hook(cmd_queue):
-    """
-    Hook only decides suppress vs pass-through and enqueues 'up'/'down'/'mute'/'quit'.
-    All UIA work happens on a dedicated worker thread (COM-safe).
-    """
-    global _vol_hook_handle, _vol_hook_proc, _cmd_queue
+def _hotkey_loop(cmd_queue, stop_event: threading.Event):
+    """Dedicated thread: blocking GetMessage + RegisterHotKey only."""
+    global _hotkey_thread_id, _cmd_queue
     _cmd_queue = cmd_queue
+    _hotkey_thread_id = ctypes.windll.kernel32.GetCurrentThreadId()
+    _log(f"[hotkey] thread_id={_hotkey_thread_id}")
 
-    def _handler(nCode, wParam, lParam):
-        try:
-            if nCode >= 0 and wParam in (WM_KEYDOWN, WM_SYSKEYDOWN):
-                kb = ctypes.cast(lParam, ctypes.POINTER(_KBDLLHOOKSTRUCT)).contents
-                if not (kb.flags & LLKHF_INJECTED):
-                    vk = int(kb.vkCode)
+    user32.RegisterHotKey(
+        None, HOTKEY_QUIT, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_Q
+    )
+    user32.RegisterHotKey(
+        None, HOTKEY_MUTE, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_M
+    )
+    vol_on = [False]
 
-                    ctrl_down = bool(user32.GetAsyncKeyState(VK_CONTROL) & 0x8000)
-                    alt_down = bool(user32.GetAsyncKeyState(VK_MENU) & 0x8000)
+    def _set_volkeys(on: bool) -> None:
+        if on and not vol_on[0]:
+            user32.RegisterHotKey(None, HOTKEY_VOLUP, MOD_NOREPEAT, VK_PRIOR)
+            user32.RegisterHotKey(None, HOTKEY_VOLDOWN, MOD_NOREPEAT, VK_NEXT)
+            vol_on[0] = True
+            _log("[hotkey] PgUp/PgDn registered")
+        elif not on and vol_on[0]:
+            user32.UnregisterHotKey(None, HOTKEY_VOLUP)
+            user32.UnregisterHotKey(None, HOTKEY_VOLDOWN)
+            vol_on[0] = False
+            _log("[hotkey] PgUp/PgDn released")
 
-                    # Quit: Ctrl+Alt+Q
-                    if vk == VK_Q and ctrl_down and alt_down:
-                        try:
-                            _cmd_queue.put_nowait("quit")
-                        except Exception:
-                            pass
-                        return 1
+    if _intercept_flag.value:
+        _set_volkeys(True)
 
-                    # Mute: Ctrl+Alt+M (only when TuneBlade owns volume)
-                    if vk == VK_M and ctrl_down and alt_down and _intercept_flag.value:
-                        _enqueue_vol("mute")
-                        return 1
-
-                    # Volume: Page Up / Page Down  (Fn+PgUp / Fn+PgDown on many laptops)
-                    if vk in (VK_PRIOR, VK_NEXT):
-                        if _intercept_flag.value:
-                            cmd = "up" if vk == VK_PRIOR else "down"
-                            _enqueue_vol(cmd)
-                            return 1  # suppress while armed (incl. key-repeat)
-                        # Master OFF → let PgUp/PgDn scroll pages as usual
-        except Exception:
-            pass
-        try:
-            return _call_next(nCode, wParam, lParam)
-        except Exception:
-            return 0
-
-    _vol_hook_proc = _LowLevelKeyboardProc(_handler)
-    _vol_hook_handle = user32.SetWindowsHookExW(WH_KEYBOARD_LL, _vol_hook_proc, None, 0)
-    if not _vol_hook_handle:
-        err = ctypes.windll.kernel32.GetLastError()
-        raise RuntimeError(f"SetWindowsHookExW failed (error {err})")
-    return _vol_hook_handle
-
-
-def remove_volume_hook():
-    global _vol_hook_handle
-    if _vol_hook_handle:
-        try:
-            user32.UnhookWindowsHookEx(_vol_hook_handle)
-        except Exception:
-            pass
-        _vol_hook_handle = None
-
-
-_main_thread_id = None  # Win32 thread id that runs GetMessage
-WM_QUIT = 0x0012
-_quit_event = threading.Event()
-
-
-def run_message_loop():
     msg = wt.MSG()
-    while True:
-        # Also wake periodically so we can exit via _quit_event if PostThreadMessage fails
-        if _quit_event.is_set():
+    while not stop_event.is_set() and not _quit_event.is_set():
+        r = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
+        if r == 0 or r == -1:
             break
-        # Peek first so we can poll quit_event without blocking forever
-        has_msg = user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 0x0001)  # PM_REMOVE
-        if has_msg:
-            if msg.message == WM_QUIT:
-                break
+        if msg.message == WM_HOTKEY:
+            kid = int(msg.wParam)
+            if kid == HOTKEY_QUIT:
+                try:
+                    cmd_queue.put_nowait("quit")
+                except Exception:
+                    post_quit()
+            elif kid == HOTKEY_MUTE:
+                if _intercept_flag.value:
+                    _enqueue_vol("mute")
+            elif kid == HOTKEY_VOLUP:
+                _enqueue_vol("up")
+            elif kid == HOTKEY_VOLDOWN:
+                _enqueue_vol("down")
+        elif msg.message == WM_APP_SET_VOLKEYS:
+            _set_volkeys(bool(msg.wParam))
+        else:
             user32.TranslateMessage(ctypes.byref(msg))
             user32.DispatchMessageW(ctypes.byref(msg))
-        else:
-            time.sleep(0.05)
+
+    _set_volkeys(False)
+    user32.UnregisterHotKey(None, HOTKEY_QUIT)
+    user32.UnregisterHotKey(None, HOTKEY_MUTE)
+    _log("[hotkey] loop ended")
 
 
 def post_quit():
-    """Signal exit from ANY thread (tray / worker / hook)."""
+    """Signal exit from ANY thread (tray / worker / hotkey)."""
     _quit_event.set()
     set_intercept(False)
     try:
         _sysvol.disarm()
     except Exception:
         pass
-    tid = _main_thread_id
-    if tid:
-        try:
-            # Must target the main UI thread — PostQuitMessage from tray thread is ignored
-            user32.PostThreadMessageW(int(tid), WM_QUIT, 0, 0)
-        except Exception as e:
-            _log(f"[quit] PostThreadMessage: {e}")
-    try:
-        user32.PostQuitMessage(0)
-    except Exception:
-        pass
+    for tid in (_hotkey_thread_id, _main_thread_id):
+        if tid:
+            try:
+                user32.PostThreadMessageW(int(tid), WM_QUIT, 0, 0)
+            except Exception as e:
+                _log(f"[quit] PostThreadMessage: {e}")
 
 
 def set_intercept(enabled: bool) -> None:
     _intercept_flag.value = 1 if enabled else 0
+    tid = _hotkey_thread_id
+    if tid:
+        try:
+            user32.PostThreadMessageW(
+                int(tid), WM_APP_SET_VOLKEYS, 1 if enabled else 0, 0
+            )
+        except Exception:
+            pass
 
 
 def uia_worker_loop(ctrl: "TuneBladeController", cmd_queue, stop_event: threading.Event):
@@ -795,9 +791,32 @@ def _find_device_block(root, device_name: str):
 
 
 def _read_master_on(root) -> bool | None:
+    """
+    Master connected? Prefer masterConnectDisconnectButton HelpText:
+      - 'Disconnect All' → currently ON (connected)
+      - 'Connect All'    → currently OFF (disconnected)
+    Do NOT use the 'ON'/'OFF' TextControl under masterPanel — that is the EQ label.
+    """
+    btn = _find_by_automation_id(root, "masterConnectDisconnectButton")
+    if btn is not None:
+        try:
+            help_txt = (getattr(btn, "HelpText", None) or "").strip().lower()
+            if not help_txt:
+                try:
+                    help_txt = (btn.GetPropertyValue(30013) or "").strip().lower()  # HelpTextProperty
+                except Exception:
+                    help_txt = ""
+            if "disconnect" in help_txt:
+                return True
+            if "connect" in help_txt:
+                return False
+        except Exception:
+            pass
+
+    # Fallback: legacy ON/OFF text, but skip the EQ row's ON
     state = [None]
 
-    def walk(ctrl, in_master=False, depth=0):
+    def walk(ctrl, in_master=False, after_eq=False, depth=0):
         if state[0] is not None or depth > 30:
             return
         try:
@@ -811,22 +830,85 @@ def _read_master_on(root) -> bool | None:
             if not in_master and ctype == "ButtonControl" and caid == "masterPanel":
                 in_master = True
             if in_master and ctype == "TextControl":
-                u = cname.upper()
-                if u == "ON":
-                    state[0] = True
-                    return
-                if u == "OFF":
-                    state[0] = False
-                    return
+                if cname.upper() == "EQ":
+                    after_eq = True
+                elif cname.upper() in ("ON", "OFF"):
+                    if after_eq:
+                        # EQ's own ON/OFF — ignore
+                        after_eq = False
+                    else:
+                        state[0] = cname.upper() == "ON"
+                        return
             child = ctrl.GetFirstChildControl()
             while child:
-                walk(child, in_master, depth + 1)
+                walk(child, in_master, after_eq, depth + 1)
                 child = child.GetNextSiblingControl()
         except Exception:
             pass
 
     walk(root)
     return state[0]
+
+
+def _find_by_automation_id(root, automation_id: str, depth_limit: int = 40):
+    """DFS find — avoids uiautomation Refind timeouts."""
+    found = [None]
+
+    def walk(ctrl, depth=0):
+        if found[0] is not None or depth > depth_limit:
+            return
+        try:
+            caid = ""
+            try:
+                caid = ctrl.AutomationId or ""
+            except Exception:
+                pass
+            if caid == automation_id:
+                found[0] = ctrl
+                return
+            child = ctrl.GetFirstChildControl()
+            while child:
+                walk(child, depth + 1)
+                child = child.GetNextSiblingControl()
+        except Exception:
+            pass
+
+    walk(root)
+    return found[0]
+
+
+def ensure_master_on(root) -> bool:
+    """
+    If Master shows OFF, click masterConnectDisconnectButton once to turn ON.
+    Does NOT ShowWindow/Hide — that can white-screen TuneBlade.
+    Returns True if Master is ON afterwards (or already was).
+    """
+    on = _read_master_on(root)
+    if on is True:
+        return True
+    if on is not False:
+        # unknown — don't click blindly
+        _log("[master] ON/OFF text not found, skip auto-enable")
+        return False
+
+    btn = _find_by_automation_id(root, "masterConnectDisconnectButton")
+    if btn is None:
+        _log("[master] connect button not found")
+        return False
+
+    try:
+        pattern = btn.GetInvokePattern()
+        if pattern is None:
+            _log("[master] no InvokePattern")
+            return False
+        pattern.Invoke()
+        time.sleep(0.6)
+        # re-read from same root may be stale; caller should refresh
+        _log("[master] clicked connect button to enable")
+        return True
+    except Exception as e:
+        _log(f"[master] enable failed: {e}")
+        return False
 
 
 def _slider_get(slider) -> float | None:
@@ -875,6 +957,10 @@ class TuneBladeController:
         self._device_status = None
         self._last_vol = None
         self._device_list: list[str] = []
+        # Auto-enable Master only at startup / first sight of OFF — never
+        # re-force ON after the user (or we) have already had Master ON once.
+        self._seen_master_on = False
+        self._auto_enable_tries = 0
 
         self.refresh_routing_state()
 
@@ -924,8 +1010,32 @@ class TuneBladeController:
             tb_found = True
             on = _read_master_on(root)
             master_on = bool(on) if on is not None else False
+
+            # Auto-enable Master once at boot/start only.
+            # If user later turns Master OFF, leave it OFF and restore system volume.
+            if on is True:
+                self._seen_master_on = True
+            elif (
+                self.cfg.get("auto_enable_master", True)
+                and on is False
+                and not self._seen_master_on
+                and self._auto_enable_tries < 20
+            ):
+                self._auto_enable_tries += 1
+                try:
+                    ensure_master_on(root)
+                    hwnd, root = self._root()
+                    if root is not None:
+                        on = _read_master_on(root)
+                        master_on = bool(on) if on is not None else False
+                        if on is True:
+                            self._seen_master_on = True
+                            _log("[master] auto-enabled at startup")
+                except Exception as e:
+                    _log(f"[master] auto_enable: {e}")
+
             try:
-                devices = _list_all_devices(root)
+                devices = _list_all_devices(root) if root is not None else []
             except Exception as e:
                 _log(f"[devices] {e}")
                 devices = []
@@ -964,9 +1074,17 @@ class TuneBladeController:
                     elif vol_txt is not None:
                         vol = float(vol_txt)
 
-        # Active = Master ON + device slider found + has speakers
-        disconnected = (status or "").strip().lower() == "disconnected"
-        active = bool(audio_ok and tb_found and master_on and slider is not None and not disconnected)
+        # Active only when Master is connected AND device is clearly connected/standby.
+        # Unknown/missing status must NOT keep the system muted.
+        status_l = (status or "").strip().lower()
+        device_routable = status_l in ("connected", "connection standby")
+        active = bool(
+            audio_ok
+            and tb_found
+            and master_on
+            and slider is not None
+            and device_routable
+        )
 
         was_active = bool(_intercept_flag.value)
         with self._lock:
@@ -983,12 +1101,16 @@ class TuneBladeController:
                 self.muted = False
 
         set_intercept(active)
-        if active and not was_active:
-            _sysvol.arm()
-        elif not active and was_active:
+        if active:
+            if not was_active:
+                _sysvol.arm()
+            else:
+                _sysvol.freeze()
+        else:
+            # Always release while inactive (not only on True→False edge).
+            # Also clear leftover OS mute from a missed disarm / previous run.
             _sysvol.disarm()
-        elif active:
-            _sysvol.freeze()
+            _sysvol.clear_leftover_mute()
 
         return {
             "audio_ok": audio_ok,
@@ -1469,6 +1591,29 @@ class TrayApp:
 
 # ── main ──────────────────────────────────────────────────────────
 
+_instance_mutex = None  # keep alive for process lifetime
+
+
+def _acquire_single_instance() -> bool:
+    """Return False if another TuneBladeController is already running."""
+    global _instance_mutex
+    try:
+        import win32api
+        import win32event
+        import winerror
+
+        handle = win32event.CreateMutex(
+            None, False, "Local\\TuneBladeController_SingleInstance"
+        )
+        _instance_mutex = handle
+        if win32api.GetLastError() == winerror.ERROR_ALREADY_EXISTS:
+            return False
+        return True
+    except Exception as e:
+        _log(f"[main] single-instance mutex failed: {e}")
+        return True
+
+
 def main():
     import queue
 
@@ -1479,13 +1624,29 @@ def main():
     _main_thread_id = ctypes.windll.kernel32.GetCurrentThreadId()
     _log(f"[main] thread_id={_main_thread_id}")
 
+    if not _acquire_single_instance():
+        _log("[main] another instance is already running — exit")
+        return
+
     if cfg.get("autostart") and not is_autostart_enabled():
         set_autostart(True)
     elif is_autostart_enabled():
         cfg["autostart"] = True
 
+    # Autostart race: TuneBlade may start a bit later — wait briefly
+    for i in range(20):
+        hwnd = win32gui.FindWindow(None, cfg.get("window_title", "TuneBlade"))
+        if hwnd:
+            break
+        time.sleep(0.5)
+    else:
+        _log("[main] TuneBlade window not found yet (will retry in poller)")
+
     ctrl = TuneBladeController(cfg)
     st = ctrl.refresh_routing_state()
+    if not st.get("active"):
+        # Previous run may have left Windows muted after a missed disarm
+        _sysvol.clear_leftover_mute()
     _volume_osd.start()
 
     _log(APP_NAME)
@@ -1525,8 +1686,8 @@ def main():
 
     def _sysvol_watch():
         """
-        Primary capture path for Fn/media volume keys that never show up as
-        VK_VOLUME_* in WH_KEYBOARD_LL — watch the Windows endpoint instead.
+        Primary capture path for Fn/media volume keys — watch the Windows
+        endpoint (those keys often never appear as hotkeys).
         """
         _log("[sysvol] watcher started")
         while not stop_event.is_set() and not _quit_event.is_set():
@@ -1544,24 +1705,25 @@ def main():
 
     threading.Thread(target=_poll, daemon=True, name="poller").start()
     threading.Thread(target=_sysvol_watch, daemon=True, name="sysvol-watch").start()
+    threading.Thread(
+        target=_hotkey_loop,
+        args=(cmd_queue, stop_event),
+        daemon=True,
+        name="hotkeys",
+    ).start()
+    _log("[hotkey] RegisterHotKey thread started (no WH_KEYBOARD_LL)")
 
-    try:
-        install_volume_hook(cmd_queue)
-        _log("[hook] installed (optional; sysvol watcher is primary)")
-    except Exception as e:
-        _log(f"[hook] install failed (sysvol watcher still works): {e}")
     try:
         signal.signal(signal.SIGINT, lambda s, f: post_quit())
     except Exception:
         pass
 
     try:
-        run_message_loop()
+        _quit_event.wait()
     finally:
         _log("[quit] cleaning up…")
         stop_event.set()
         _quit_event.set()
-        remove_volume_hook()
         set_intercept(False)
         try:
             _sysvol.disarm()

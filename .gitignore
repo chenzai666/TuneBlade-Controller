@@ -9,3 +9,7 @@ __pycache__/
 .vscode/
 *.exe
 TuneBladeController/
+
+@AutomationLog.txt
+AutomationLog.txt
+
