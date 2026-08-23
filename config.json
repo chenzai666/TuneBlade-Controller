@@ -3,7 +3,8 @@
     "volume_step": 5,
     "window_title": "TuneBlade",
     "poll_interval_sec": 1.0,
-    "autostart": false,
+    "autostart": true,
     "debug_log": false,
-    "auto_enable_master": true
+    "auto_enable_master": true,
+    "auto_connect_device": true
 }

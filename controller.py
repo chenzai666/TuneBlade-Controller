@@ -55,7 +55,8 @@ DEFAULT_CFG = {
     "poll_interval_sec": 1.0,
     "autostart": False,
     "debug_log": False,  # True 才写 TuneBladeController.log，日常请保持关闭
-    "auto_enable_master": True,  # 仅启动时自动开一次 Master；用户手动关掉后不再强开
+    "auto_enable_master": True,  # 开机启动时自动开 Master（仅一次窗口）
+    "auto_connect_device": True,  # 开机启动时若设备 Disconnected 则自动点连接
 }
 
 _debug_log_enabled = False
@@ -189,6 +190,12 @@ class SystemVolumeLock:
         self._we_muted = False
         self._ep = None
         self._cooldown_until = 0.0
+        # TUN/VPN/adapter flips can make EndpointVolume briefly report garbage
+        # (often a big drop). Ignore those as TuneBlade volume keys.
+        self._glitch_vol_jump = 0.06  # ≥6% in one poll ≈ not a key step
+
+    def _invalidate_endpoint(self):
+        self._ep = None
 
     def _endpoint(self):
         if self._ep is not None:
@@ -201,6 +208,7 @@ class SystemVolumeLock:
             return self._ep
         except Exception as e:
             _log(f"[sysvol] endpoint: {e}")
+            self._ep = None
             return None
 
     def arm(self):
@@ -315,6 +323,9 @@ class SystemVolumeLock:
         """
         If OS volume/mute drifted from the muted hold point, snap it back
         and return 'up' | 'down' | 'mute' for TuneBlade.
+
+        Ignores endpoint glitches from TUN/VPN/adapter switches (sudden big
+        jumps, or downward drift while we still force mute).
         """
         with self._lock:
             if not self._active or self._hold_vol is None:
@@ -335,6 +346,13 @@ class SystemVolumeLock:
                 muted = int(ep.GetMute())
             except Exception as e:
                 _log(f"[sysvol] read: {e}")
+                self._invalidate_endpoint()
+                self._cooldown_until = now + 1.0
+                return None
+
+            if not (0.0 <= cur <= 1.0):
+                self._invalidate_endpoint()
+                self._cooldown_until = now + 1.0
                 return None
 
             d_vol = cur - float(self._hold_vol)
@@ -342,11 +360,31 @@ class SystemVolumeLock:
             if muted == 1 and abs(d_vol) < 0.0015:
                 return None
 
+            # Sudden jump (e.g. TUN on/off): restore hold, do NOT nudge TuneBlade
+            if abs(d_vol) >= float(self._glitch_vol_jump):
+                try:
+                    self._hold_unlocked()
+                except Exception:
+                    pass
+                self._invalidate_endpoint()
+                self._cooldown_until = now + 1.2
+                _log(f"[sysvol] ignore glitch d_vol={d_vol:+.3f} muted={muted}")
+                return None
+
             if muted == 0 and abs(d_vol) < 0.02:
                 cmd = "up"  # unmute / vol-up while we forced mute
             elif d_vol > 0.0015:
                 cmd = "up"
             elif d_vol < -0.0015:
+                # While we force mute, downward scalar drift is usually adapter
+                # noise (TUN), not a volume key — just re-freeze.
+                if muted == 1:
+                    try:
+                        self._hold_unlocked()
+                    except Exception:
+                        pass
+                    self._cooldown_until = now + 0.45
+                    return None
                 cmd = "down"
             else:
                 cmd = "mute"
@@ -757,6 +795,7 @@ def _list_all_devices(root) -> list[dict]:
                                 "status": status,
                                 "slider": slider,
                                 "volume": vol,
+                                "row": ctrl,
                             }
                         )
 
@@ -883,17 +922,24 @@ def ensure_master_on(root) -> bool:
     Does NOT ShowWindow/Hide — that can white-screen TuneBlade.
     Returns True if Master is ON afterwards (or already was).
     """
+    btn = _find_by_automation_id(root, "masterConnectDisconnectButton")
     on = _read_master_on(root)
     if on is True:
         return True
-    if on is not False:
-        # unknown — don't click blindly
-        _log("[master] ON/OFF text not found, skip auto-enable")
-        return False
-
-    btn = _find_by_automation_id(root, "masterConnectDisconnectButton")
     if btn is None:
         _log("[master] connect button not found")
+        return False
+
+    help_txt = ""
+    try:
+        help_txt = (getattr(btn, "HelpText", None) or "").strip().lower()
+    except Exception:
+        help_txt = ""
+    if "disconnect" in help_txt:
+        return True
+    if on is None and "connect" not in help_txt:
+        # UI not ready — try again later
+        _log("[master] state unknown, skip this tick")
         return False
 
     try:
@@ -902,12 +948,89 @@ def ensure_master_on(root) -> bool:
             _log("[master] no InvokePattern")
             return False
         pattern.Invoke()
-        time.sleep(0.6)
-        # re-read from same root may be stale; caller should refresh
+        time.sleep(0.8)
+        # Verify; some boots need a second Click when Invoke is ignored
+        on2 = _read_master_on(root)
+        if on2 is not True:
+            try:
+                btn.Click(simulateMove=False)
+                time.sleep(0.8)
+            except Exception:
+                pass
         _log("[master] clicked connect button to enable")
         return True
     except Exception as e:
         _log(f"[master] enable failed: {e}")
+        return False
+
+
+def _find_device_connect_button(row):
+    """Small square button on the right of a device row (connect/disconnect)."""
+    if row is None:
+        return None
+    candidates = []
+
+    def walk(ctrl, depth=0):
+        if depth > 6:
+            return
+        try:
+            if ctrl.ControlTypeName == "ButtonControl":
+                aid = ""
+                try:
+                    aid = ctrl.AutomationId or ""
+                except Exception:
+                    pass
+                if aid in ("IncreaseLarge", "DecreaseLarge"):
+                    return
+                try:
+                    r = ctrl.BoundingRectangle
+                    w, h = int(r.width()), int(r.height())
+                except Exception:
+                    return
+                # Device connect is a small icon button (~25–40px), not the whole row
+                if 16 <= w <= 48 and 16 <= h <= 48:
+                    candidates.append((r.left, ctrl))
+            child = ctrl.GetFirstChildControl()
+            while child:
+                walk(child, depth + 1)
+                child = child.GetNextSiblingControl()
+        except Exception:
+            pass
+
+    walk(row)
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    return candidates[0][1]
+
+
+def ensure_device_connected(device: dict) -> bool:
+    """
+    If device status is Disconnected, click its connect button once.
+    Leaves Connected / Connection Standby alone.
+    """
+    if not device:
+        return False
+    status = (device.get("status") or "").strip().lower()
+    if status in ("connected", "connection standby"):
+        return True
+    if status and status != "disconnected":
+        # Unknown status — don't click
+        return False
+    btn = _find_device_connect_button(device.get("row"))
+    if btn is None:
+        _log(f"[device] connect button not found for {device.get('name')!r}")
+        return False
+    try:
+        pattern = btn.GetInvokePattern()
+        if pattern is None:
+            return False
+        pattern.Invoke()
+        time.sleep(0.9)
+        _log(f"[device] clicked connect for {device.get('name')!r} (was {device.get('status')!r})")
+        return True
+    except Exception as e:
+        _log(f"[device] connect failed: {e}")
         return False
 
 
@@ -948,7 +1071,9 @@ class TuneBladeController:
         self.device_name = str(cfg.get("device_name") or "").strip()
         self.step = max(1, int(cfg.get("volume_step") or 5))
         self.muted = False
-        self._mute_bk = 50.0
+        # Volume to restore on unmute — never default to 50%.
+        self._mute_bk: float | None = None
+        self._last_nonzero_vol: float | None = None
         self._lock = threading.RLock()
         self._slider = None
         self._audio_ok = True
@@ -957,10 +1082,11 @@ class TuneBladeController:
         self._device_status = None
         self._last_vol = None
         self._device_list: list[str] = []
-        # Auto-enable Master only at startup / first sight of OFF — never
-        # re-force ON after the user (or we) have already had Master ON once.
+        # Boot window: auto Master + auto device connect (time-based, not try-count).
+        # After the user has had Master ON once, never force it back on.
         self._seen_master_on = False
-        self._auto_enable_tries = 0
+        self._boot_deadline = time.monotonic() + 120.0
+        self._device_connect_attempts = 0
 
         self.refresh_routing_state()
 
@@ -1011,17 +1137,16 @@ class TuneBladeController:
             on = _read_master_on(root)
             master_on = bool(on) if on is not None else False
 
-            # Auto-enable Master once at boot/start only.
+            # Auto-enable Master during boot window only.
             # If user later turns Master OFF, leave it OFF and restore system volume.
+            in_boot = time.monotonic() < self._boot_deadline
             if on is True:
                 self._seen_master_on = True
             elif (
                 self.cfg.get("auto_enable_master", True)
-                and on is False
                 and not self._seen_master_on
-                and self._auto_enable_tries < 20
+                and in_boot
             ):
-                self._auto_enable_tries += 1
                 try:
                     ensure_master_on(root)
                     hwnd, root = self._root()
@@ -1063,6 +1188,34 @@ class TuneBladeController:
                     except Exception:
                         pass
 
+            # Auto-connect selected device while Disconnected (boot window)
+            if (
+                chosen is not None
+                and self.cfg.get("auto_connect_device", True)
+                and master_on
+                and in_boot
+                and self._device_connect_attempts < 15
+            ):
+                st0 = (chosen.get("status") or "").strip().lower()
+                # Only when clearly Disconnected. Standby/Connected = TuneBlade
+                # Auto Connect already did its job after Master came on.
+                if st0 == "disconnected":
+                    self._device_connect_attempts += 1
+                    try:
+                        ensure_device_connected(chosen)
+                        # refresh device list after click
+                        try:
+                            devices = _list_all_devices(root) if root is not None else devices
+                        except Exception:
+                            pass
+                        want2 = (self.device_name or "").strip()
+                        for d in devices:
+                            if d["name"] == want2 or (not want2 and d is devices[0]):
+                                chosen = d
+                                break
+                    except Exception as e:
+                        _log(f"[device] auto_connect: {e}")
+
             if chosen is not None:
                 status = chosen.get("status")
                 slider = chosen.get("slider")
@@ -1074,19 +1227,17 @@ class TuneBladeController:
                     elif vol_txt is not None:
                         vol = float(vol_txt)
 
-        # Active only when Master is connected AND device is clearly connected/standby.
-        # Unknown/missing status must NOT keep the system muted.
+        # Hotkeys as soon as Master is ON and the device row/slider exists
+        # (boot: AirPlay may still be connecting). Mute local speakers only when
+        # the device is clearly Connected / Connection Standby.
         status_l = (status or "").strip().lower()
         device_routable = status_l in ("connected", "connection standby")
-        active = bool(
-            audio_ok
-            and tb_found
-            and master_on
-            and slider is not None
-            and device_routable
-        )
+        keys_ok = bool(audio_ok and tb_found and master_on and slider is not None)
+        mute_ok = bool(keys_ok and device_routable)
+        active = mute_ok  # tray "green" = fully routing (muted + connected)
 
-        was_active = bool(_intercept_flag.value)
+        was_keys = bool(_intercept_flag.value)
+        was_muted = bool(_sysvol.active)
         with self._lock:
             self._audio_ok = audio_ok
             self._tb_found = tb_found
@@ -1099,18 +1250,26 @@ class TuneBladeController:
                 self.muted = True
             elif vol and vol > 0:
                 self.muted = False
+                self._last_nonzero_vol = float(vol)
+                # Keep a restore point even if mute was entered via vol-down to 0
+                if self._mute_bk is None:
+                    self._mute_bk = float(vol)
 
-        set_intercept(active)
-        if active:
-            if not was_active:
+        set_intercept(keys_ok)
+        if mute_ok:
+            if not was_muted:
                 _sysvol.arm()
             else:
                 _sysvol.freeze()
         else:
-            # Always release while inactive (not only on True→False edge).
-            # Also clear leftover OS mute from a missed disarm / previous run.
+            # Not fully routing — never leave the PC muted.
             _sysvol.disarm()
             _sysvol.clear_leftover_mute()
+
+        if keys_ok and not was_keys:
+            _log("[keys] volume hotkeys armed (Master ON + slider)")
+        elif not keys_ok and was_keys:
+            _log("[keys] volume hotkeys released")
 
         return {
             "audio_ok": audio_ok,
@@ -1118,6 +1277,7 @@ class TuneBladeController:
             "master_on": master_on,
             "device_status": status,
             "active": active,
+            "keys_ok": keys_ok,
             "volume": vol,
             "devices": [d["name"] for d in devices],
         }
@@ -1174,12 +1334,20 @@ class TuneBladeController:
             _log("[nudge] cannot read slider")
             return
         new_v = cur + delta
+        # About to hit 0 via keys — remember level for unmute
+        if cur > 0 and new_v <= 0:
+            with self._lock:
+                self._mute_bk = float(cur)
+                self._last_nonzero_vol = float(cur)
         if _slider_set(slider, new_v):
             time.sleep(0.05)
             vol = _slider_get(slider)
             with self._lock:
                 self._last_vol = vol
                 self.muted = bool(vol is not None and vol <= 0)
+                if vol is not None and vol > 0:
+                    self._last_nonzero_vol = float(vol)
+                    self._mute_bk = float(vol)
             _sysvol.freeze()
             if vol is not None:
                 _log(f"volume {cur} -> {vol} (step {delta})")
@@ -1199,6 +1367,18 @@ class TuneBladeController:
     def volume_down(self):
         self._nudge(-float(self.step))
 
+    def _unmute_target(self) -> float:
+        """Restore volume from before mute — prefer backup, never invent 50%."""
+        for candidate in (self._mute_bk, self._last_nonzero_vol, self._last_vol):
+            try:
+                v = float(candidate) if candidate is not None else 0.0
+            except (TypeError, ValueError):
+                continue
+            if v > 0:
+                return max(v, float(self.step))
+        # Last resort if we never saw a non-zero level this session
+        return max(25.0, float(self.step))
+
     def toggle_mute(self):
         if self.should_intercept():
             _sysvol.freeze()
@@ -1211,18 +1391,21 @@ class TuneBladeController:
         if vol is None:
             return
         if not self.muted and vol > 0:
-            self._mute_bk = vol
+            self._mute_bk = float(vol)
+            self._last_nonzero_vol = float(vol)
             if _slider_set(slider, 0):
                 self.muted = True
                 with self._lock:
                     self._last_vol = 0
-                _log("muted")
+                _log(f"muted (backup {self._mute_bk})")
         else:
-            target = max(float(self._mute_bk or self.step), float(self.step))
+            target = self._unmute_target()
             if _slider_set(slider, target):
                 self.muted = False
                 with self._lock:
                     self._last_vol = target
+                    self._last_nonzero_vol = float(target)
+                    self._mute_bk = float(target)
                 _log(f"unmuted -> {target}")
         _sysvol.freeze()
         show_volume_osd(self.device_name, self._last_vol, self.muted)
@@ -1633,13 +1816,10 @@ def main():
     elif is_autostart_enabled():
         cfg["autostart"] = True
 
-    # Autostart race: TuneBlade may start a bit later — wait briefly
-    for i in range(20):
-        hwnd = win32gui.FindWindow(None, cfg.get("window_title", "TuneBlade"))
-        if hwnd:
-            break
-        time.sleep(0.5)
-    else:
+    # Do NOT block here waiting for TuneBlade — that left hotkeys dead for
+    # several seconds after login. Poller will pick TB up as soon as it appears.
+    hwnd0 = win32gui.FindWindow(None, cfg.get("window_title", "TuneBlade"))
+    if not hwnd0:
         _log("[main] TuneBlade window not found yet (will retry in poller)")
 
     ctrl = TuneBladeController(cfg)
@@ -1657,12 +1837,14 @@ def main():
     _log(f"  Master        : {st['master_on']}")
     _log(f"  device status : {st['device_status']!r}")
     _log(f"  active        : {st['active']}")
+    _log(f"  keys_ok       : {st.get('keys_ok')}")
     _log(f"  volume        : {st['volume']}")
     _log(f"  mode          : {ctrl.mode_label()}")
     _log(f"  intercept     : {_intercept_flag.value}")
 
     cmd_queue: queue.Queue = queue.Queue(maxsize=32)
     stop_event = threading.Event()
+    boot_deadline = time.monotonic() + 90.0  # fast-poll window after login
     threading.Thread(
         target=uia_worker_loop,
         args=(ctrl, cmd_queue, stop_event),
@@ -1675,7 +1857,12 @@ def main():
 
     def _poll():
         while not stop_event.is_set() and not _quit_event.is_set():
-            time.sleep(float(cfg.get("poll_interval_sec", 1.0) or 1.0))
+            # Boot: poll faster so Master auto-on + hotkeys engage ASAP
+            if time.monotonic() < boot_deadline and not _intercept_flag.value:
+                delay = 0.25
+            else:
+                delay = float(cfg.get("poll_interval_sec", 1.0) or 1.0)
+            time.sleep(delay)
             try:
                 cmd_queue.put_nowait("refresh")
             except Exception:
