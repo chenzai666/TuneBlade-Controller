@@ -6,5 +6,9 @@
     "autostart": true,
     "debug_log": false,
     "auto_enable_master": true,
-    "auto_connect_device": true
+    "auto_connect_device": true,
+    "hotkey_vol_up": "Ctrl+Alt+PgUp",
+    "hotkey_vol_down": "Ctrl+Alt+PgDn",
+    "hotkey_mute": "Ctrl+Alt+M",
+    "hotkey_quit": "Ctrl+Alt+Q"
 }

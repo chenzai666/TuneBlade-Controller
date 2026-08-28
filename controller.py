@@ -57,6 +57,11 @@ DEFAULT_CFG = {
     "debug_log": False,  # True 才写 TuneBladeController.log，日常请保持关闭
     "auto_enable_master": True,  # 开机启动时自动开 Master（仅一次窗口）
     "auto_connect_device": True,  # 开机启动时若设备 Disconnected 则自动点连接
+    # 可自定义，格式如 Ctrl+Alt+PgUp / Ctrl+Shift+Up / Ctrl+Alt+F1
+    "hotkey_vol_up": "Ctrl+Alt+PgUp",
+    "hotkey_vol_down": "Ctrl+Alt+PgDn",
+    "hotkey_mute": "Ctrl+Alt+M",
+    "hotkey_quit": "Ctrl+Alt+Q",
 }
 
 _debug_log_enabled = False
@@ -504,26 +509,56 @@ def set_autostart(enabled: bool) -> None:
 
 
 # ── hotkeys (NO low-level keyboard hook) ──────────────────────────
-# WH_KEYBOARD_LL on a Python thread that also sleeps/polls will freeze
-# typing AND the mouse (Windows waits for the hook; timeout stalls input).
-# RegisterHotKey only steals the combos we care about; everything else
-# (letters, mouse wheel, left click) is untouched.
+# RegisterHotKey only steals the configured combos. Default volume keys are
+# Ctrl+Alt+PgUp/PgDn so plain PgUp/PgDn still scroll while typing.
 
-VK_PRIOR = 0x21  # Page Up   → volume up while routing
-VK_NEXT = 0x22   # Page Down → volume down while routing
-VK_Q = 0x51
-VK_M = 0x4D
 MOD_ALT = 0x0001
 MOD_CONTROL = 0x0002
+MOD_SHIFT = 0x0004
+MOD_WIN = 0x0008
 MOD_NOREPEAT = 0x4000
 WM_QUIT = 0x0012
 WM_HOTKEY = 0x0312
-WM_APP_SET_VOLKEYS = 0x8001  # WM_APP+1 → enable/disable PgUp/PgDn hotkeys
+WM_APP_RELOAD_HOTKEYS = 0x8002
 
 HOTKEY_QUIT = 1
 HOTKEY_MUTE = 2
 HOTKEY_VOLUP = 3
 HOTKEY_VOLDOWN = 4
+
+_VK_ALIASES = {
+    "pgup": 0x21,
+    "pageup": 0x21,
+    "prior": 0x21,
+    "pgdn": 0x22,
+    "pagedown": 0x22,
+    "pagedn": 0x22,
+    "next": 0x22,
+    "up": 0x26,
+    "down": 0x28,
+    "left": 0x25,
+    "right": 0x27,
+    "space": 0x20,
+    "tab": 0x09,
+    "esc": 0x1B,
+    "escape": 0x1B,
+    "enter": 0x0D,
+    "return": 0x0D,
+    "home": 0x24,
+    "end": 0x23,
+    "insert": 0x2D,
+    "ins": 0x2D,
+    "delete": 0x2E,
+    "del": 0x2E,
+    "backspace": 0x08,
+    "bksp": 0x08,
+}
+for _i in range(1, 13):
+    _VK_ALIASES[f"f{_i}"] = 0x70 + _i - 1
+for _i in range(10):
+    _VK_ALIASES[str(_i)] = 0x30 + _i
+for _c in "abcdefghijklmnopqrstuvwxyz":
+    _VK_ALIASES[_c] = ord(_c.upper())
 
 WPARAM_T = ctypes.c_size_t
 LPARAM_T = ctypes.c_ssize_t
@@ -553,6 +588,47 @@ _VOL_DEBOUNCE_SEC = 0.22
 _hotkey_thread_id = None
 _main_thread_id = None
 _quit_event = threading.Event()
+_hotkey_labels: dict[str, str] = {}
+
+
+def parse_hotkey(spec: str) -> tuple[int, int] | None:
+    """Parse 'Ctrl+Alt+PgUp' → (modifiers, vk)."""
+    if not spec or not str(spec).strip():
+        return None
+    parts = [p.strip().lower() for p in str(spec).replace("-", "+").split("+") if p.strip()]
+    if not parts:
+        return None
+    mods = 0
+    key = None
+    for p in parts:
+        if p in ("ctrl", "control", "ctl"):
+            mods |= MOD_CONTROL
+        elif p in ("alt", "menu"):
+            mods |= MOD_ALT
+        elif p in ("shift",):
+            mods |= MOD_SHIFT
+        elif p in ("win", "windows", "cmd", "super", "meta"):
+            mods |= MOD_WIN
+        else:
+            key = p
+    if not key:
+        return None
+    vk = _VK_ALIASES.get(key)
+    if vk is None and len(key) == 1:
+        vk = ord(key.upper())
+    if vk is None:
+        return None
+    return mods, int(vk)
+
+
+def hotkey_label(cfg: dict | None = None) -> dict[str, str]:
+    c = cfg or load_config()
+    return {
+        "vol_up": str(c.get("hotkey_vol_up") or DEFAULT_CFG["hotkey_vol_up"]),
+        "vol_down": str(c.get("hotkey_vol_down") or DEFAULT_CFG["hotkey_vol_down"]),
+        "mute": str(c.get("hotkey_mute") or DEFAULT_CFG["hotkey_mute"]),
+        "quit": str(c.get("hotkey_quit") or DEFAULT_CFG["hotkey_quit"]),
+    }
 
 
 def _enqueue_vol(cmd: str) -> bool:
@@ -573,35 +649,60 @@ def _enqueue_vol(cmd: str) -> bool:
         return False
 
 
+def reload_hotkeys() -> None:
+    tid = _hotkey_thread_id
+    if tid:
+        try:
+            user32.PostThreadMessageW(int(tid), WM_APP_RELOAD_HOTKEYS, 0, 0)
+        except Exception as e:
+            _log(f"[hotkey] reload post failed: {e}")
+
+
 def _hotkey_loop(cmd_queue, stop_event: threading.Event):
     """Dedicated thread: blocking GetMessage + RegisterHotKey only."""
-    global _hotkey_thread_id, _cmd_queue
+    global _hotkey_thread_id, _cmd_queue, _hotkey_labels
     _cmd_queue = cmd_queue
     _hotkey_thread_id = ctypes.windll.kernel32.GetCurrentThreadId()
     _log(f"[hotkey] thread_id={_hotkey_thread_id}")
 
-    user32.RegisterHotKey(
-        None, HOTKEY_QUIT, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_Q
-    )
-    user32.RegisterHotKey(
-        None, HOTKEY_MUTE, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_M
-    )
-    vol_on = [False]
+    registered: list[int] = []
 
-    def _set_volkeys(on: bool) -> None:
-        if on and not vol_on[0]:
-            user32.RegisterHotKey(None, HOTKEY_VOLUP, MOD_NOREPEAT, VK_PRIOR)
-            user32.RegisterHotKey(None, HOTKEY_VOLDOWN, MOD_NOREPEAT, VK_NEXT)
-            vol_on[0] = True
-            _log("[hotkey] PgUp/PgDn registered")
-        elif not on and vol_on[0]:
-            user32.UnregisterHotKey(None, HOTKEY_VOLUP)
-            user32.UnregisterHotKey(None, HOTKEY_VOLDOWN)
-            vol_on[0] = False
-            _log("[hotkey] PgUp/PgDn released")
+    def _unregister_all() -> None:
+        for hid in list(registered):
+            try:
+                user32.UnregisterHotKey(None, hid)
+            except Exception:
+                pass
+        registered.clear()
 
-    if _intercept_flag.value:
-        _set_volkeys(True)
+    def _register_all() -> None:
+        global _hotkey_labels
+        nonlocal registered
+        _unregister_all()
+        cfg = load_config()
+        labels = hotkey_label(cfg)
+        _hotkey_labels = dict(labels)
+        specs = [
+            (HOTKEY_QUIT, labels["quit"], "quit"),
+            (HOTKEY_MUTE, labels["mute"], "mute"),
+            (HOTKEY_VOLUP, labels["vol_up"], "vol_up"),
+            (HOTKEY_VOLDOWN, labels["vol_down"], "vol_down"),
+        ]
+        for hid, spec, name in specs:
+            parsed = parse_hotkey(spec)
+            if not parsed:
+                _log(f"[hotkey] invalid {name}={spec!r}")
+                continue
+            mods, vk = parsed
+            ok = bool(user32.RegisterHotKey(None, hid, mods | MOD_NOREPEAT, vk))
+            if ok:
+                registered.append(hid)
+                _log(f"[hotkey] registered {name}={spec}")
+            else:
+                err = ctypes.windll.kernel32.GetLastError()
+                _log(f"[hotkey] RegisterHotKey failed {name}={spec} err={err}")
+
+    _register_all()
 
     msg = wt.MSG()
     while not stop_event.is_set() and not _quit_event.is_set():
@@ -619,18 +720,19 @@ def _hotkey_loop(cmd_queue, stop_event: threading.Event):
                 if _intercept_flag.value:
                     _enqueue_vol("mute")
             elif kid == HOTKEY_VOLUP:
-                _enqueue_vol("up")
+                if _intercept_flag.value:
+                    _enqueue_vol("up")
             elif kid == HOTKEY_VOLDOWN:
-                _enqueue_vol("down")
-        elif msg.message == WM_APP_SET_VOLKEYS:
-            _set_volkeys(bool(msg.wParam))
+                if _intercept_flag.value:
+                    _enqueue_vol("down")
+        elif msg.message == WM_APP_RELOAD_HOTKEYS:
+            _register_all()
+            _log("[hotkey] reloaded from config")
         else:
             user32.TranslateMessage(ctypes.byref(msg))
             user32.DispatchMessageW(ctypes.byref(msg))
 
-    _set_volkeys(False)
-    user32.UnregisterHotKey(None, HOTKEY_QUIT)
-    user32.UnregisterHotKey(None, HOTKEY_MUTE)
+    _unregister_all()
     _log("[hotkey] loop ended")
 
 
@@ -651,15 +753,77 @@ def post_quit():
 
 
 def set_intercept(enabled: bool) -> None:
+    # Volume/mute hotkeys stay registered (with modifiers); actions gated here.
     _intercept_flag.value = 1 if enabled else 0
-    tid = _hotkey_thread_id
-    if tid:
+
+
+def open_hotkey_settings(cfg: dict) -> None:
+    """Simple dialog to edit hotkeys; saves config.json and reloads bindings."""
+    try:
+        import tkinter as tk
+        from tkinter import messagebox
+    except Exception as e:
+        _log(f"[hotkey] tkinter unavailable: {e}")
         try:
-            user32.PostThreadMessageW(
-                int(tid), WM_APP_SET_VOLKEYS, 1 if enabled else 0, 0
-            )
+            os.startfile(str(CONFIG_PATH))
         except Exception:
             pass
+        return
+
+    def _run():
+        root = tk.Tk()
+        root.title("TuneBlade 快捷键")
+        root.attributes("-topmost", True)
+        root.resizable(False, False)
+        labels = hotkey_label(cfg)
+        fields = [
+            ("升高音量", "hotkey_vol_up", labels["vol_up"]),
+            ("降低音量", "hotkey_vol_down", labels["vol_down"]),
+            ("静音切换", "hotkey_mute", labels["mute"]),
+            ("退出程序", "hotkey_quit", labels["quit"]),
+        ]
+        entries: dict[str, tk.Entry] = {}
+        frm = tk.Frame(root, padx=14, pady=12)
+        frm.pack(fill="both", expand=True)
+        tk.Label(
+            frm,
+            text="格式示例：Ctrl+Alt+PgUp、Ctrl+Shift+Up、Ctrl+Alt+F1",
+            fg="#555",
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
+        for i, (title, key, val) in enumerate(fields, start=1):
+            tk.Label(frm, text=title, width=10, anchor="w").grid(row=i, column=0, sticky="w", pady=3)
+            ent = tk.Entry(frm, width=28)
+            ent.insert(0, val)
+            ent.grid(row=i, column=1, sticky="we", pady=3)
+            entries[key] = ent
+
+        def on_save():
+            patch = {}
+            for key, ent in entries.items():
+                spec = ent.get().strip()
+                if not parse_hotkey(spec):
+                    messagebox.showerror("无效快捷键", f"{key}: {spec}\n请用 Ctrl/Alt/Shift + 键名", parent=root)
+                    return
+                patch[key] = spec
+            cfg.update(patch)
+            save_config(cfg)
+            reload_hotkeys()
+            messagebox.showinfo("已保存", "快捷键已更新并重新注册", parent=root)
+            root.destroy()
+
+        def on_reset():
+            for key, ent in entries.items():
+                ent.delete(0, "end")
+                ent.insert(0, str(DEFAULT_CFG[key]))
+
+        btns = tk.Frame(frm)
+        btns.grid(row=len(fields) + 1, column=0, columnspan=2, pady=(12, 0), sticky="e")
+        tk.Button(btns, text="恢复默认", command=on_reset).pack(side="left", padx=(0, 8))
+        tk.Button(btns, text="取消", command=root.destroy).pack(side="left", padx=(0, 8))
+        tk.Button(btns, text="保存", command=on_save).pack(side="left")
+        root.mainloop()
+
+    threading.Thread(target=_run, daemon=True, name="hotkey-ui").start()
 
 
 def uia_worker_loop(ctrl: "TuneBladeController", cmd_queue, stop_event: threading.Event):
@@ -1696,10 +1860,42 @@ class TrayApp:
                 pystray.MenuItem("(设备菜单不可用)", None, enabled=False)
             )
 
+        def open_hotkeys(icon, item):
+            open_hotkey_settings(self.cfg)
+            self._refresh_menu()
+
+        def reload_keys(icon, item):
+            # Re-read config from disk (user may have edited config.json)
+            try:
+                self.cfg.update(load_config())
+            except Exception:
+                pass
+            reload_hotkeys()
+            self._refresh_menu()
+
+        def open_cfg(icon, item):
+            try:
+                os.startfile(str(CONFIG_PATH))
+            except Exception as e:
+                _log(f"[tray] open config: {e}")
+
+        hk = hotkey_label(self.cfg)
+        hotkey_menu = pystray.Menu(
+            pystray.MenuItem(f"升高：{hk['vol_up']}", None, enabled=False),
+            pystray.MenuItem(f"降低：{hk['vol_down']}", None, enabled=False),
+            pystray.MenuItem(f"静音：{hk['mute']}", None, enabled=False),
+            pystray.MenuItem(f"退出：{hk['quit']}", None, enabled=False),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("设置快捷键…", open_hotkeys),
+            pystray.MenuItem("打开 config.json", open_cfg),
+            pystray.MenuItem("重新加载快捷键", reload_keys),
+        )
+
         return pystray.Menu(
             pystray.MenuItem(lambda item: self.ctrl.mode_label(), None, enabled=False),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("选择设备", device_menu),
+            pystray.MenuItem("快捷键", hotkey_menu),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem(
                 "开机自启",
