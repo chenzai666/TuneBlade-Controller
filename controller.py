@@ -1111,17 +1111,12 @@ def ensure_master_on(root) -> bool:
         if pattern is None:
             _log("[master] no InvokePattern")
             return False
+        # Invoke only — never mouse Click. Hidden TuneBlade rows often report
+        # BoundingRectangle at (0,0); Click would yank the cursor to top-left
+        # every boot poll.
         pattern.Invoke()
         time.sleep(0.8)
-        # Verify; some boots need a second Click when Invoke is ignored
-        on2 = _read_master_on(root)
-        if on2 is not True:
-            try:
-                btn.Click(simulateMove=False)
-                time.sleep(0.8)
-            except Exception:
-                pass
-        _log("[master] clicked connect button to enable")
+        _log("[master] invoked connect button to enable")
         return True
     except Exception as e:
         _log(f"[master] enable failed: {e}")
